@@ -1,150 +1,131 @@
 #!/usr/bin/env python3
-"""Entrypoint for the 20 November 2026 news front page.
+"""Validate entry.png and deliver it to the output directory.
 
-Reads entry.png from this directory, checks it is a well-formed
-1024x1024 PNG of at most 1 MiB whose pixel data decodes cleanly,
-then writes an exact copy to $MAKEFUN_OUTPUT_DIR/entry.png
-(default /output) with mode 0644.
-
-Standard library only. No network access. Deterministic: repeated
-runs write identical bytes.
+Reads entry.png from this script's own directory, checks that it is a
+well-formed 1024x1024, 8-bit RGB PNG under 1 MiB with valid chunk CRCs
+and a decodable image body, then copies it byte-for-byte to
+$MAKEFUN_OUTPUT_DIR/entry.png (default /output) with mode 0644.
+No network access, no randomness, fully deterministic.
 """
-import hashlib
+
+import binascii
 import os
 import struct
 import sys
 import zlib
 
-LIMIT_BYTES = 1048576
-SIDE = 1024
-SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+EXPECTED_WIDTH = 1024
+EXPECTED_HEIGHT = 1024
+EXPECTED_DEPTH = 8
+EXPECTED_COLOUR_TYPE = 2  # truecolour RGB
+MAX_FILE_BYTES = 1024 * 1024
+DEFAULT_OUTPUT_DIR = "/output"
+OUTPUT_NAME = "entry.png"
+SOURCE_NAME = "entry.png"
 
 
-class BadEntry(Exception):
-    """Raised when entry.png fails a validation check."""
+class ImageError(ValueError):
+    """Raised when entry.png fails any validation check."""
 
 
-def iter_chunks(data):
-    """Yield (type, body) for every chunk in order.
-
-    Each chunk's CRC is verified against its stored value, the first
-    chunk must be a 13-byte IHDR, and nothing may follow IEND.
-    Raises BadEntry on any flaw.
-    """
-    if data[:8] != SIGNATURE:
-        raise BadEntry("missing PNG signature")
-    if len(data) < 8 + 25:
-        raise BadEntry("file too short for an IHDR chunk")
-    offset = 8
-    first = True
-    while offset + 8 <= len(data):
-        size, kind = struct.unpack_from(">I4s", data, offset)
-        if first:
-            if kind != b"IHDR" or size != 13:
-                raise BadEntry("first chunk is not a 13-byte IHDR")
-            first = False
-        stop = offset + 12 + size
-        if stop > len(data):
-            raise BadEntry("chunk %r is truncated"
-                           % kind.decode("ascii", "replace"))
-        body = data[offset + 8:offset + 8 + size]
-        want, = struct.unpack_from(">I", data, offset + 8 + size)
-        got = zlib.crc32(kind + body) & 0xFFFFFFFF
-        if want != got:
-            raise BadEntry("CRC mismatch in %r chunk"
-                           % kind.decode("ascii", "replace"))
-        yield kind, body
-        if kind == b"IEND":
-            if stop != len(data):
-                raise BadEntry("bytes follow the IEND chunk")
-            return
-        offset = stop
-    raise BadEntry("no IEND chunk found")
+def _check_crc(tag, payload, stored_crc):
+    actual = binascii.crc32(tag + payload) & 0xFFFFFFFF
+    if actual != stored_crc:
+        raise ImageError("bad CRC on {} chunk".format(tag.decode("ascii")))
 
 
-def check_dimensions(data):
-    """Check the IHDR size fields; return (width, height)."""
-    width, height = struct.unpack_from(">II", data, 16)
-    if (width, height) != (SIDE, SIDE):
-        raise BadEntry("entry.png is %dx%d, expected 1024x1024"
-                       % (width, height))
-    bit_depth, color_type = data[24], data[25]
-    if (bit_depth, color_type) != (8, 2):
-        raise BadEntry("IHDR says bit depth %d, color type %d; "
-                       "expected 8-bit RGB" % (bit_depth, color_type))
-    return width, height
+def _read_chunks(data):
+    """Yield (tag, payload) for every chunk after the PNG signature."""
+    if data[:8] != PNG_SIGNATURE:
+        raise ImageError("missing PNG signature")
+    pos = 8
+    while pos < len(data):
+        if pos + 8 > len(data):
+            raise ImageError("truncated chunk header")
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        tag = data[pos + 4:pos + 8]
+        end = pos + 8 + length + 4
+        if end > len(data):
+            raise ImageError("truncated {} chunk".format(tag.decode("ascii")))
+        payload = data[pos + 8:pos + 8 + length]
+        stored = struct.unpack(">I", data[pos + 8 + length:end])[0]
+        _check_crc(tag, payload, stored)
+        yield tag, payload
+        pos = end
+        if tag == b"IEND":
+            break
+    if pos != len(data):
+        raise ImageError("trailing bytes after IEND")
 
 
-def validate(data):
-    """Check size, dimensions and decodability; return (width, height)."""
-    if len(data) > LIMIT_BYTES:
-        raise BadEntry("entry.png is %d bytes, over the 1 MiB limit"
-                       % len(data))
-    width, height = check_dimensions(data)
-    payload = bytearray()
-    saw_iend = False
-    for kind, body in iter_chunks(data):
-        if kind == b"IDAT":
-            payload += body
-        elif kind == b"IEND":
-            saw_iend = True
-    if not saw_iend:
-        raise BadEntry("no IEND chunk found")
-    if not payload:
-        raise BadEntry("no IDAT chunk found")
+def validate_png(path):
+    """Read and fully validate the PNG; return its raw bytes."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if len(data) > MAX_FILE_BYTES:
+        raise ImageError("file is {} bytes, over the 1 MiB limit".format(len(data)))
+    chunks = list(_read_chunks(data))
+    if not chunks or chunks[0][0] != b"IHDR":
+        raise ImageError("first chunk is not IHDR")
+    header = chunks[0][1]
+    if len(header) != 13:
+        raise ImageError("IHDR is {} bytes, expected 13".format(len(header)))
+    width, height, depth, colour, comp, filt, interlace = struct.unpack(
+        ">IIBBBBB", header)
+    if (width, height) != (EXPECTED_WIDTH, EXPECTED_HEIGHT):
+        raise ImageError("size is {}x{}, expected 1024x1024".format(width, height))
+    if depth != EXPECTED_DEPTH or colour != EXPECTED_COLOUR_TYPE:
+        raise ImageError("expected 8-bit RGB, got depth {} colour {}".format(
+            depth, colour))
+    if comp != 0 or filt != 0 or interlace != 0:
+        raise ImageError("unexpected compression/filter/interlace flags")
+    idat = b"".join(payload for tag, payload in chunks if tag == b"IDAT")
+    if not idat:
+        raise ImageError("no IDAT data found")
     try:
-        pixels = zlib.decompress(bytes(payload))
-    except zlib.error:
-        raise BadEntry("IDAT data does not decompress")
-    expect = SIDE * (1 + SIDE * 3)
-    if len(pixels) != expect:
-        raise BadEntry("decoded to %d bytes, expected %d"
-                       % (len(pixels), expect))
-    return width, height
+        raw = zlib.decompress(idat)
+    except zlib.error as exc:
+        raise ImageError("IDAT does not decompress: {}".format(exc))
+    stride = EXPECTED_WIDTH * 3
+    expected_raw = EXPECTED_HEIGHT * (stride + 1)
+    if len(raw) != expected_raw:
+        raise ImageError("decoded image is {} bytes, expected {}".format(
+            len(raw), expected_raw))
+    for row in range(EXPECTED_HEIGHT):
+        if raw[row * (stride + 1)] != 0:
+            raise ImageError("scanline {} uses an unsupported filter".format(row))
+    return data
 
 
-def main():
-    here = os.path.dirname(os.path.abspath(__file__))
-    source = os.path.join(here, "entry.png")
-    try:
-        with open(source, "rb") as handle:
-            data = handle.read()
-    except OSError:
-        print("error: entry.png not found next to main.py", file=sys.stderr)
-        raise SystemExit(1)
-    try:
-        width, height = validate(data)
-    except BadEntry as exc:
-        print("error: " + str(exc), file=sys.stderr)
-        raise SystemExit(1)
+def resolve_output_dir():
+    """Output directory from the environment, falling back to /output."""
+    return os.environ.get("MAKEFUN_OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
 
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-    except OSError as exc:
-        print("error: cannot create %s: %s" % (out_dir, exc),
-              file=sys.stderr)
-        raise SystemExit(1)
-    target = os.path.join(out_dir, "entry.png")
+
+def deliver(data, out_dir):
+    """Write the validated bytes to the output directory, mode 0644."""
+    os.makedirs(out_dir, exist_ok=True)
+    target = os.path.join(out_dir, OUTPUT_NAME)
     with open(target, "wb") as handle:
         handle.write(data)
-    # The grader reads the output as an unprivileged user, so the
-    # file must be world-readable regardless of the caller's umask.
     os.chmod(target, 0o644)
-    written_mode = os.stat(target).st_mode & 0o777
-    if written_mode != 0o644:
-        print("error: output mode is %03o, expected 0644" % written_mode,
-              file=sys.stderr)
-        raise SystemExit(1)
-    with open(target, "rb") as handle:
-        if handle.read() != data:
-            print("error: written output differs from entry.png",
-                  file=sys.stderr)
-            raise SystemExit(1)
-    digest = hashlib.sha256(data).hexdigest()
-    print("wrote %s (%d bytes, %dx%d, sha256 %s)"
-          % (target, len(data), width, height, digest))
+    return target
+
+
+def main(argv):
+    here = os.path.dirname(os.path.abspath(__file__))
+    source = os.path.join(here, SOURCE_NAME)
+    out_dir = resolve_output_dir()
+    try:
+        data = validate_png(source)
+    except (OSError, ImageError) as exc:
+        print("error: {}: {}".format(source, exc), file=sys.stderr)
+        return 1
+    target = deliver(data, out_dir)
+    print("wrote {} ({} bytes, mode 0644)".format(target, len(data)))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv))
